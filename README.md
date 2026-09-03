@@ -12,7 +12,7 @@ project to practice backend API design used in banking and fintech systems.
 - Protects against duplicate transfers using an **idempotency key**
 - Prevents overdrawing a wallet
 - Stores money as integers (pesewas) instead of decimals, to avoid
-  floating-point rounding errors — a real practice in payment systems
+  floating-point rounding errors a real practice in payment systems
 
 ## Tech stack
 
@@ -63,5 +63,5 @@ how real payment APIs (Stripe, Paystack, mobile money switches) behave.
 ## Why this project
 
 Built to understand the backend patterns behind mobile money platforms in
-Ghana (e.g. FlexiPAY by First Atlantic Bank) — REST API design, safe money
+Ghana (e.g. FlexiPAY by First Atlantic Bank) REST API design, safe money
 handling, and idempotent transaction processing.
