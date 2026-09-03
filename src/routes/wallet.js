@@ -1,102 +1,132 @@
 const express = require("express");
 const router = express.Router();
-const { users, transactions } = require("../data/store");
+const pool = require("../data/db");
 
 // --- GET /wallet/:userId/balance ---
-// Simple: "show me how much money this person has"
-// Technical: a GET request reads data and should never change anything (no side effects)
-router.get("/:userId/balance", (req, res) => {
-  const user = users[req.params.userId];
+router.get("/:userId/balance", async (req, res) => {
+  try {
+    // $1 is a placeholder — the actual value (req.params.userId) is passed
+    // separately in the array below. This is a PARAMETERIZED QUERY.
+    // Never do this instead: `SELECT * FROM users WHERE id = ${userId}`
+    // — that string-builds SQL directly from user input, which opens the
+    // door to SQL INJECTION (a malicious user typing SQL instead of an ID).
+    const result = await pool.query("SELECT * FROM users WHERE id = $1", [req.params.userId]);
 
-  // req.params.userId comes from the ":userId" part of the URL, e.g. /wallet/u1/balance
-  if (!user) {
-    // 404 = "Not Found" — a standard HTTP status code meaning the resource doesn't exist
-    return res.status(404).json({ error: "User not found" });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const user = result.rows[0];
+    res.status(200).json({
+      userId: user.id,
+      name: user.name,
+      balance: user.balance / 100,
+      currency: "GHS",
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
   }
-
-  res.status(200).json({
-    userId: user.id,
-    name: user.name,
-    balance: user.balance / 100, // convert pesewas back to cedis for display
-    currency: "GHS",
-  });
 });
 
 // --- POST /wallet/transfer ---
-// Simple: "move money from one person to another, safely"
-// Technical: a POST request creates/changes state — here, it changes two balances
-router.post("/transfer", (req, res) => {
+router.post("/transfer", async (req, res) => {
   const { fromUserId, toUserId, amount, idempotencyKey } = req.body;
-  // req.body is the JSON data sent by whoever called this API.
-  // Express needs "express.json()" middleware (added in index.js) to parse it.
 
-  // --- Basic validation ---
-  // Simple: check the request actually makes sense before doing anything
-  // Technical: this is "input validation" — never trust incoming data
-  if (!fromUserId || !toUserId || !amount) {
-    return res.status(400).json({ error: "fromUserId, toUserId and amount are required" });
+  if (!fromUserId || !toUserId || !amount || !idempotencyKey) {
+    return res.status(400).json({ error: "fromUserId, toUserId, amount and idempotencyKey are required" });
   }
   if (amount <= 0) {
     return res.status(400).json({ error: "amount must be greater than zero" });
   }
-  if (!idempotencyKey) {
-    return res.status(400).json({ error: "idempotencyKey is required" });
-  }
-
-  // --- Idempotency check ---
-  // Simple: if the app sends the same "send money" request twice (e.g. because
-  // the network was slow and it retried), we must NOT send the money twice.
-  // Technical: idempotency means calling an operation multiple times with the
-  // same key produces the same result as calling it once. Payment systems rely
-  // on this constantly — every real payment API (Stripe, Paystack, mobile money
-  // switches) requires an idempotency key for this exact reason.
-  const existing = transactions.find((t) => t.idempotencyKey === idempotencyKey);
-  if (existing) {
-    return res.status(200).json({ message: "Duplicate request — original result returned", transaction: existing });
-  }
-
-  const sender = users[fromUserId];
-  const receiver = users[toUserId];
-  if (!sender || !receiver) {
-    return res.status(404).json({ error: "fromUserId or toUserId does not exist" });
-  }
 
   const amountInPesewas = Math.round(amount * 100);
 
-  if (sender.balance < amountInPesewas) {
-    // 409 = "Conflict" — the request is valid, but current state prevents it
-    return res.status(409).json({ error: "Insufficient balance" });
+  // A "client" here is one single connection checked out from the pool,
+  // used for every query in this transaction so they all happen together.
+  const client = await pool.connect();
+
+  try {
+    // BEGIN starts a transaction: nothing below is permanent until COMMIT.
+    // If ANYTHING fails in between, we ROLLBACK and it's as if none of it happened.
+    await client.query("BEGIN");
+
+    // Check idempotency first — has this exact request already succeeded?
+    const existing = await client.query(
+      "SELECT * FROM transactions WHERE idempotency_key = $1",
+      [idempotencyKey]
+    );
+    if (existing.rows.length > 0) {
+      await client.query("ROLLBACK"); // nothing to commit, we're just reading
+      return res.status(200).json({
+        message: "Duplicate request — original result returned",
+        transaction: existing.rows[0],
+      });
+    }
+
+    // SELECT ... FOR UPDATE locks this row until the transaction ends.
+    // Simple: it's like putting a "do not disturb" sign on the sender's
+    // account row so no OTHER request can read/change it at the same time.
+    // Technical: this prevents a RACE CONDITION — e.g. two simultaneous
+    // transfer requests both reading the same starting balance and both
+    // succeeding, when only one should have.
+    const senderResult = await client.query(
+      "SELECT * FROM users WHERE id = $1 FOR UPDATE",
+      [fromUserId]
+    );
+    const receiverResult = await client.query(
+      "SELECT * FROM users WHERE id = $1 FOR UPDATE",
+      [toUserId]
+    );
+
+    if (senderResult.rows.length === 0 || receiverResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "fromUserId or toUserId does not exist" });
+    }
+
+    const sender = senderResult.rows[0];
+    if (sender.balance < amountInPesewas) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Insufficient balance" });
+    }
+
+    // Debit sender, credit receiver — two writes, one transaction.
+    await client.query("UPDATE users SET balance = balance - $1 WHERE id = $2", [amountInPesewas, fromUserId]);
+    await client.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [amountInPesewas, toUserId]);
+
+    const txResult = await client.query(
+      `INSERT INTO transactions (from_user_id, to_user_id, amount, idempotency_key)
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [fromUserId, toUserId, amountInPesewas, idempotencyKey]
+    );
+
+    // COMMIT makes everything above permanent, all at once.
+    await client.query("COMMIT");
+
+    res.status(201).json({ message: "Transfer successful", transaction: txResult.rows[0] });
+  } catch (err) {
+    // If ANYTHING threw an error above, undo all of it.
+    await client.query("ROLLBACK");
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
+  } finally {
+    // Always release the connection back to the pool, success or failure.
+    client.release();
   }
-
-  // --- The actual transfer ---
-  // Technical: in a real database this would be wrapped in a transaction
-  // (BEGIN / COMMIT / ROLLBACK) so that if anything fails halfway, NOTHING
-  // changes — both balances update, or neither does. We'll implement that
-  // for real once we move this to Postgres in the next project stage.
-  sender.balance -= amountInPesewas;
-  receiver.balance += amountInPesewas;
-
-  const transaction = {
-    id: `tx_${Date.now()}`,
-    fromUserId,
-    toUserId,
-    amount: amountInPesewas,
-    status: "completed",
-    idempotencyKey,
-    timestamp: new Date().toISOString(),
-  };
-  transactions.push(transaction);
-
-  res.status(201).json({ message: "Transfer successful", transaction });
 });
 
 // --- GET /wallet/:userId/transactions ---
-router.get("/:userId/transactions", (req, res) => {
-  const userId = req.params.userId;
-  const history = transactions.filter(
-    (t) => t.fromUserId === userId || t.toUserId === userId
-  );
-  res.status(200).json({ userId, count: history.length, transactions: history });
+router.get("/:userId/transactions", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM transactions WHERE from_user_id = $1 OR to_user_id = $1 ORDER BY created_at DESC",
+      [req.params.userId]
+    );
+    res.status(200).json({ userId: req.params.userId, count: result.rows.length, transactions: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
+  }
 });
 
 module.exports = router;
