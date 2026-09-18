@@ -1,15 +1,17 @@
 const express = require("express");
 const router = express.Router();
 const pool = require("../data/db");
+const requireAuth = require("../middleware/auth");
+
+router.use(requireAuth);
 
 // --- GET /wallet/:userId/balance ---
 router.get("/:userId/balance", async (req, res) => {
+  if (Number(req.params.userId) !== req.userId) {
+    return res.status(403).json({ error: "You can only view your own balance" });
+  }
+
   try {
-    // $1 is a placeholder — the actual value (req.params.userId) is passed
-    // separately in the array below. This is a PARAMETERIZED QUERY.
-    // Never do this instead: `SELECT * FROM users WHERE id = ${userId}`
-    // — that string-builds SQL directly from user input, which opens the
-    // door to SQL INJECTION (a malicious user typing SQL instead of an ID).
     const result = await pool.query("SELECT * FROM users WHERE id = $1", [req.params.userId]);
 
     if (result.rows.length === 0) {
@@ -36,40 +38,31 @@ router.post("/transfer", async (req, res) => {
   if (!fromUserId || !toUserId || !amount || !idempotencyKey) {
     return res.status(400).json({ error: "fromUserId, toUserId, amount and idempotencyKey are required" });
   }
+  if (Number(fromUserId) !== req.userId) {
+    return res.status(403).json({ error: "You can only transfer from your own account" });
+  }
   if (amount <= 0) {
     return res.status(400).json({ error: "amount must be greater than zero" });
   }
 
   const amountInPesewas = Math.round(amount * 100);
-
-  // A "client" here is one single connection checked out from the pool,
-  // used for every query in this transaction so they all happen together.
   const client = await pool.connect();
 
   try {
-    // BEGIN starts a transaction: nothing below is permanent until COMMIT.
-    // If ANYTHING fails in between, we ROLLBACK and it's as if none of it happened.
     await client.query("BEGIN");
 
-    // Check idempotency first — has this exact request already succeeded?
     const existing = await client.query(
       "SELECT * FROM transactions WHERE idempotency_key = $1",
       [idempotencyKey]
     );
     if (existing.rows.length > 0) {
-      await client.query("ROLLBACK"); // nothing to commit, we're just reading
+      await client.query("ROLLBACK");
       return res.status(200).json({
-        message: "Duplicate request — original result returned",
+        message: "Duplicate request -- original result returned",
         transaction: existing.rows[0],
       });
     }
 
-    // SELECT ... FOR UPDATE locks this row until the transaction ends.
-    // Simple: it's like putting a "do not disturb" sign on the sender's
-    // account row so no OTHER request can read/change it at the same time.
-    // Technical: this prevents a RACE CONDITION — e.g. two simultaneous
-    // transfer requests both reading the same starting balance and both
-    // succeeding, when only one should have.
     const senderResult = await client.query(
       "SELECT * FROM users WHERE id = $1 FOR UPDATE",
       [fromUserId]
@@ -90,7 +83,6 @@ router.post("/transfer", async (req, res) => {
       return res.status(409).json({ error: "Insufficient balance" });
     }
 
-    // Debit sender, credit receiver — two writes, one transaction.
     await client.query("UPDATE users SET balance = balance - $1 WHERE id = $2", [amountInPesewas, fromUserId]);
     await client.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [amountInPesewas, toUserId]);
 
@@ -100,17 +92,14 @@ router.post("/transfer", async (req, res) => {
       [fromUserId, toUserId, amountInPesewas, idempotencyKey]
     );
 
-    // COMMIT makes everything above permanent, all at once.
     await client.query("COMMIT");
 
     res.status(201).json({ message: "Transfer successful", transaction: txResult.rows[0] });
   } catch (err) {
-    // If ANYTHING threw an error above, undo all of it.
     await client.query("ROLLBACK");
     console.error(err);
     res.status(500).json({ error: "Internal server error" });
   } finally {
-    // Always release the connection back to the pool, success or failure.
     client.release();
   }
 });

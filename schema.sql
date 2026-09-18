@@ -11,6 +11,10 @@ CREATE TABLE IF NOT EXISTS users (
   id SERIAL PRIMARY KEY,
   name VARCHAR(100) NOT NULL,
   phone VARCHAR(20) UNIQUE NOT NULL,
+  password_hash VARCHAR(100),
+  -- Never store a real password. This holds the OUTPUT of bcrypt hashing —
+  -- a one-way scramble. Even if this database ever leaked, an attacker
+  -- cannot reverse this back into the real password.
   balance BIGINT NOT NULL DEFAULT 0 CHECK (balance >= 0),
   -- balance stored in pesewas (integer), same reasoning as before: avoid
   -- floating point rounding errors with money.
@@ -29,6 +33,19 @@ CREATE TABLE IF NOT EXISTS transactions (
   idempotency_key VARCHAR(100) UNIQUE NOT NULL,
   -- UNIQUE here means the database itself will reject a duplicate
   -- idempotency key — a second layer of protection beyond our app code.
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS otps (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  code VARCHAR(6) NOT NULL,
+  expires_at TIMESTAMP NOT NULL,
+  -- expires_at means this code stops working after a short window (we'll use
+  -- 5 minutes). This limits how long a leaked/intercepted code is useful for.
+  used BOOLEAN NOT NULL DEFAULT FALSE,
+  -- Once a code is used, we mark it so it can never be replayed again —
+  -- the same idempotency-style thinking we used for transfers.
   created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
